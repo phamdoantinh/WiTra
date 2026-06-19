@@ -15,9 +15,6 @@ try:
         create_mtl_adapter,
         SUPPORTED_STRATEGIES,
         _HAS_LEARNABLE_PARAMS,
-        _NEEDS_LOSS_BUFFER,
-        _NEEDS_UPDATE_W,
-        _COMPILE_INCOMPATIBLE,
     )
     from train.mtl_losses import CoordLoss, BuildingLoss, FloorLoss
 except (ImportError, ModuleNotFoundError):
@@ -26,9 +23,6 @@ except (ImportError, ModuleNotFoundError):
         create_mtl_adapter,
         SUPPORTED_STRATEGIES,
         _HAS_LEARNABLE_PARAMS,
-        _NEEDS_LOSS_BUFFER,
-        _NEEDS_UPDATE_W,
-        _COMPILE_INCOMPATIBLE,
     )
     from mtl_losses import CoordLoss, BuildingLoss, FloorLoss
 
@@ -54,6 +48,9 @@ class MTLTrainer(Trainer):
         floor_acc_weight: float = 5.0,
         use_amp: bool = True,
         use_compile: bool = True,
+        w_diff: float = 0.01,
+        w_sim: float = 0.0,
+        w_sp_diff: float = 0.01,
     ):
         # ── Validate BEFORE anything else — no silent fallback ────────────────
         if mtl_strategy not in SUPPORTED_STRATEGIES:
@@ -76,19 +73,21 @@ class MTLTrainer(Trainer):
         # ── AMP (bf16) — RTX 5060 Ti has native bf16, no GradScaler needed ───
         self._amp_dtype = torch.bfloat16  # bf16: no overflow, no scaler needed
 
-        # ── torch.compile — incompatible with retain_graph strategies ───────────
-        if use_compile and self.device.type == "cuda" and mtl_strategy not in _COMPILE_INCOMPATIBLE:
+        # ── torch.compile ────────────────────────────────────────────────────
+        if use_compile and self.device.type == "cuda":
             try:
+                # Disable donated buffers to allow retain_graph=True with torch.compile
+                try:
+                    import torch._functorch.config as functorch_config
+                    functorch_config.donated_buffer = False
+                except (ImportError, AttributeError):
+                    pass
                 self.model = torch.compile(self.model, mode="reduce-overhead")
-                msg = "torch.compile enabled (mode=reduce-overhead)"
+                msg = "torch.compile enabled (mode=reduce-overhead, donated_buffer=False)"
                 (self.logger.info if self.logger else print)(msg)
             except Exception as e:
                 msg = f"torch.compile failed, falling back to eager: {e}"
                 (self.logger.warning if self.logger else print)(msg)
-        elif use_compile and mtl_strategy in _COMPILE_INCOMPATIBLE:
-            msg = (f"torch.compile skipped — {mtl_strategy} uses retain_graph=True "
-                   f"(incompatible with donated buffers)")
-            (self.logger.info if self.logger else print)(msg)
 
         # ── Per-task loss functions (AbsLoss) ─────────────────────────────────
         self.coord_loss_fn    = CoordLoss()
@@ -97,6 +96,9 @@ class MTLTrainer(Trainer):
             gamma=floor_focal_gamma,
         )
         self.floor_acc_weight = floor_acc_weight  # for composite checkpoint metric
+        self.w_diff           = w_diff
+        self.w_sim            = w_sim
+        self.w_sp_diff        = w_sp_diff
 
         msg = (
             f"  FloorLoss: Focal(gamma={floor_focal_gamma})"
@@ -123,7 +125,6 @@ class MTLTrainer(Trainer):
         self,
         learning_rate: float = 1e-4,
         weight_decay: float = 0.01,
-        kan_lr_scale: float = 1.0,
         **_ignored,           # absorb coord/building/floor_loss_weight kwargs
     ):
         """
@@ -132,24 +133,7 @@ class MTLTrainer(Trainer):
         coord/building/floor_loss_weight kwargs are silently ignored —
         weighting is handled by mtl_adapter.backward().
         """
-        # Split model parameters if kan_lr_scale != 1.0
-        kan_params = []
-        other_params = []
-        for name, p in self.model.named_parameters():
-            if "kan" in name.lower() or "spline" in name.lower():
-                kan_params.append(p)
-            else:
-                other_params.append(p)
-
-        if len(kan_params) > 0 and kan_lr_scale != 1.0:
-            param_groups = [
-                {"params": other_params, "lr": learning_rate},
-                {"params": kan_params,   "lr": learning_rate * kan_lr_scale},
-            ]
-            msg = f"  KAN parameter groups split: other_lr={learning_rate:.2e}, kan_lr={learning_rate * kan_lr_scale:.2e}"
-            (self.logger.info if self.logger else print)(msg)
-        else:
-            param_groups = [{"params": self.model.parameters(), "lr": learning_rate}]
+        param_groups = [{"params": self.model.parameters(), "lr": learning_rate}]
 
         if self.mtl_strategy in _HAS_LEARNABLE_PARAMS:
             # MTLAdapter is nn.Module and stores wrapped_model as attribute,
@@ -204,6 +188,9 @@ class MTLTrainer(Trainer):
         total_coord    = 0.0
         total_building = 0.0
         total_floor    = 0.0
+        total_diff     = 0.0
+        total_sim      = 0.0
+        total_sp_diff  = 0.0
         num_batches    = 0
 
         pbar = tqdm(
@@ -223,7 +210,7 @@ class MTLTrainer(Trainer):
             # ── Forward under bf16 autocast (backward stays fp32) ────────────
             with torch.autocast(device_type="cuda", dtype=self._amp_dtype,
                                 enabled=self.use_amp):
-                coord_pred, floor_pred, building_pred = self.model(features)
+                coord_pred, floor_pred, building_pred, aux_losses = self.model(features, return_ortho_loss=True)
                 # losses computed inside autocast — still fp32 scalars after .item()
                 coord_loss    = self.coord_loss_fn._update_loss(coord_pred.float(), coords)
                 building_loss = self.building_loss_fn._update_loss(building_pred.float(), building)
@@ -233,6 +220,15 @@ class MTLTrainer(Trainer):
             losses_tensor = torch.stack([coord_loss, building_loss, floor_loss])
 
             self.optimizer.zero_grad()
+            
+            # ── Backpropagate Shared-Private Auxiliary Loss directly on shared backbone FIRST ──
+            # We use retain_graph=True so that LibMTL can subsequently backward through the shared graph.
+            if aux_losses is not None:
+                l_diff, l_sim, l_sp_diff = aux_losses
+                loss_aux = self.w_diff * l_diff + self.w_sim * l_sim + self.w_sp_diff * l_sp_diff
+                if loss_aux > 0:
+                    loss_aux.backward(retain_graph=True)
+
             # MTL backward: weighting class computes & injects re-weighted grads (fp32)
             self.mtl_adapter.backward(losses_tensor, **self.mtl_kwargs)
 
@@ -240,25 +236,22 @@ class MTLTrainer(Trainer):
             torch.nn.utils.clip_grad_norm_(self.model.parameters(), max_norm=1.0)
             self.optimizer.step()
 
-            # FAMO: update task weights using new losses after model step
-            if self.mtl_strategy in _NEEDS_UPDATE_W:
-                with torch.no_grad():
-                    coord_pred2, floor_pred2, building_pred2 = self.model(features)
-                    curr_losses = torch.stack([
-                        self.coord_loss_fn._update_loss(coord_pred2.float(), coords),
-                        self.building_loss_fn._update_loss(building_pred2.float(), building),
-                        self.floor_loss_fn._update_loss(floor_pred2.float(), floor),
-                    ])
-                self.mtl_adapter.update_w(curr_losses)
+
 
             # Accumulate scalar values
             c_val = coord_loss.item()
             b_val = building_loss.item()
             f_val = floor_loss.item()
+            diff_val = l_diff.item() if aux_losses is not None else 0.0
+            sim_val = l_sim.item() if aux_losses is not None else 0.0
+            sp_diff_val = l_sp_diff.item() if aux_losses is not None else 0.0
 
             total_coord    += c_val
             total_building += b_val
             total_floor    += f_val
+            total_diff     += diff_val
+            total_sim      += sim_val
+            total_sp_diff  += sp_diff_val
             num_batches    += 1
 
             pbar.set_postfix(
@@ -266,6 +259,8 @@ class MTLTrainer(Trainer):
                     "crd":   f"{c_val:.4f}",
                     "bld":   f"{b_val:.4f}",
                     "flr":   f"{f_val:.4f}",
+                    "diff":  f"{diff_val:.4f}",
+                    "sim":   f"{sim_val:.4f}",
                 }
             )
 
@@ -278,6 +273,9 @@ class MTLTrainer(Trainer):
             "coord_loss":    total_coord    / num_batches,
             "building_loss": total_building / num_batches,
             "floor_loss":    total_floor    / num_batches,
+            "diff_loss":     total_diff     / num_batches,
+            "sim_loss":      total_sim      / num_batches,
+            "sp_diff_loss":  total_sp_diff  / num_batches,
         }
 
     # ── fit ───────────────────────────────────────────────────────────────────
@@ -308,12 +306,7 @@ class MTLTrainer(Trainer):
             # ── Train ─────────────────────────────────────────────────────────
             train_metrics = self.train_epoch(train_loader, epoch)
 
-            # ── Update loss buffer (DWA reads prev 2 epochs, GradNorm reads 0)
-            if self.mtl_strategy in _NEEDS_LOSS_BUFFER:
-                ep_idx = epoch - 1
-                self.mtl_adapter.train_loss_buffer[0, ep_idx] = train_metrics["coord_loss"]
-                self.mtl_adapter.train_loss_buffer[1, ep_idx] = train_metrics["building_loss"]
-                self.mtl_adapter.train_loss_buffer[2, ep_idx] = train_metrics["floor_loss"]
+
 
             # ── Validate ──────────────────────────────────────────────────────
             val_metrics = self.evaluate(val_loader, split="val")
@@ -329,10 +322,17 @@ class MTLTrainer(Trainer):
             self.history["train_coord_loss"].append(train_metrics["coord_loss"])
             self.history["train_building_loss"].append(train_metrics["building_loss"])
             self.history["train_floor_loss"].append(train_metrics["floor_loss"])
+            self.history["train_diff_loss"].append(train_metrics["diff_loss"])
+            self.history["train_sim_loss"].append(train_metrics["sim_loss"])
+            self.history["train_sp_diff_loss"].append(train_metrics["sp_diff_loss"])
+            
             self.history["val_loss"].append(val_metrics["loss"])
             self.history["val_coord_loss"].append(val_metrics["coord_loss"])
             self.history["val_building_loss"].append(val_metrics["building_loss"])
             self.history["val_floor_loss"].append(val_metrics["floor_loss"])
+            self.history["val_diff_loss"].append(val_metrics["diff_loss"])
+            self.history["val_sim_loss"].append(val_metrics["sim_loss"])
+            self.history["val_sp_diff_loss"].append(val_metrics["sp_diff_loss"])
             self.history["val_coord_error"].append(val_metrics["coord_error_mean"])
             self.history["val_building_acc"].append(val_metrics["building_acc"])
             self.history["val_floor_acc"].append(val_metrics["floor_acc"])
@@ -340,8 +340,8 @@ class MTLTrainer(Trainer):
             # ── Log ───────────────────────────────────────────────────────────
             log_msg = (
                 f"\nEpoch {epoch}/{num_epochs} ({epoch_time:.1f}s) [{self.mtl_strategy}]\n"
-                f"  Train: loss={train_metrics['loss']:.4f} (coord={train_metrics['coord_loss']:.4f}, bld={train_metrics['building_loss']:.4f}, flr={train_metrics['floor_loss']:.4f})\n"
-                f"  Valid: loss={val_metrics['loss']:.4f} (coord={val_metrics['coord_loss']:.4f}, bld={val_metrics['building_loss']:.4f}, flr={val_metrics['floor_loss']:.4f})\n"
+                f"  Train: loss={train_metrics['loss']:.4f} (coord={train_metrics['coord_loss']:.4f}, bld={train_metrics['building_loss']:.4f}, flr={train_metrics['floor_loss']:.4f}, diff={train_metrics['diff_loss']:.4f}, sim={train_metrics['sim_loss']:.4f}, sp={train_metrics['sp_diff_loss']:.4f})\n"
+                f"  Valid: loss={val_metrics['loss']:.4f} (coord={val_metrics['coord_loss']:.4f}, bld={val_metrics['building_loss']:.4f}, flr={val_metrics['floor_loss']:.4f}, diff={val_metrics['diff_loss']:.4f}, sim={val_metrics['sim_loss']:.4f}, sp={val_metrics['sp_diff_loss']:.4f})\n"
                 f"  Metrics: error={val_metrics['coord_error_mean']:.2f}m (med={val_metrics['coord_error_median']:.2f}m) | bld={val_metrics['building_acc']:.2f}% | flr={val_metrics['floor_acc']:.2f}%"
             )
             (self.logger.info if self.logger else print)(log_msg)

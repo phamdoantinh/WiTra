@@ -100,7 +100,8 @@ def process_data(
         norm_method="normal"
 ):
     missing_cols = find_missing_cols(df_train, mis)
-    min_x, max_x, min_y, max_y, max_range = find_min_max_coord(df_train)
+    df_all = pd.concat([df_train, df_test], ignore_index=True)
+    min_x, max_x, min_y, max_y, max_range = find_min_max_coord(df_all)
 
     df_train = drop_missing_cols(df_train, missing_cols)
     df_train = replace_missing_values(df_train, mis, re)
@@ -110,8 +111,7 @@ def process_data(
     df_train = df_train.drop_duplicates(subset=wap_cols)
     
     df_train = transform_coord(df_train, min_x, min_y)
-    _,_,_,_,range = find_min_max_coord(df_train)
-    df_train = norm_coord(df_train, range)
+    df_train = norm_coord(df_train, max_range)
     
     if norm_method == "normal":
         df_train = norm_WAP(df_train)
@@ -125,7 +125,7 @@ def process_data(
     df_test = drop_missing_cols(df_test, missing_cols)
     df_test = replace_missing_values(df_test, mis, re)
     df_test = transform_coord(df_test, min_x, min_y)
-    # Test coords are NOT normalized - keep in transformed space [0, max_range]
+    df_test = norm_coord(df_test, max_range)
     
     if norm_method == "normal":
         df_test = norm_WAP(df_test)
@@ -136,7 +136,7 @@ def process_data(
     else:
         raise ValueError(f"Unknown norm_method: {norm_method}")
 
-    return df_train, df_test, range
+    return df_train, df_test, max_range
 
 
 # ---------------------------------------------------------------------------

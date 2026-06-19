@@ -1,9 +1,9 @@
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-import math
 from typing import Optional, Tuple, Callable
 
+# ── Base Modules ────────────────────────────────────────────────────────────
 def drop_path(x, drop_prob: float = 0., training: bool = False, scale_by_keep: bool = True):
     if drop_prob == 0. or not training:
         return x
@@ -80,7 +80,6 @@ class Attention(nn.Module):
             attn_drop: float = 0.,
             proj_drop: float = 0.,
             norm_layer: Optional[Callable] = nn.LayerNorm,
-            attn_noise: float = 0.,
     ):
         super().__init__()
         assert dim % num_heads == 0
@@ -99,17 +98,15 @@ class Attention(nn.Module):
         B, N, C = x.shape
         qkv = self.qkv(x).reshape(B, N, 3, self.num_heads, self.head_dim).permute(2, 0, 3, 1, 4)
         q, k, v = qkv.unbind(0)
-        # QK-Norm: per-head LN stabilizes attention logits (defined in __init__ but was missing here)
         q = self.q_norm(q)
         k = self.k_norm(k)
-        q = q*self.scale
+        q = q * self.scale
 
         attn_logits = (q @ k.transpose(-2, -1))
         attn = attn_logits.softmax(dim=-1)
         attn = self.attn_drop(attn)
 
         x = attn @ v
-
         x = x.transpose(1, 2).reshape(B, N, C)
         x = self.proj(x)
         x = self.proj_drop(x)
@@ -125,6 +122,7 @@ class Block(nn.Module):
             norm_layer: Optional[Callable] = nn.LayerNorm,
             mlp_layer: Optional[Callable] = Mlp,
             drop_path: float = 0.,
+            dropout: float = 0.,
     ):
         super().__init__()
         self.norm1 = norm_layer(dim)
@@ -138,7 +136,7 @@ class Block(nn.Module):
             hidden_features=int(dim * mlp_ratio),
             act_layer=act_layer,
             norm_layer=norm_layer,
-            drop = drop_path,
+            drop = dropout,  # Use regular dropout for the MLP projection
         )
         self.ls2 = layerScale(dim)
         self.drop_path2 = DropPath(drop_path) if drop_path > 0. else nn.Identity()
@@ -184,7 +182,6 @@ class EnCoder(nn.Module):
             act_layer: nn.Module = nn.GELU,
             learn_pos: bool = True,
             dropout: float = 0.,
-
     ):
         super().__init__()
         self.input_dim = input_dim
@@ -203,13 +200,14 @@ class EnCoder(nn.Module):
         self.pos_drop = nn.Dropout(p=dropout)
 
         dpr = [x.item() for x in torch.linspace(0, dropout, depth)]
-
+        
         self.blocks = nn.ModuleList([
             Block(
                 dim      = embed_dim,
                 attn_cfg = dict(block_cfg.get('attn_cfg', {})),  # copy — Block.pop() mutates
                 mlp_ratio = block_cfg.get('mlp_ratio', 4),
                 drop_path = dpr[i],
+                dropout   = dropout,  # Propagate regular dropout to Transformer Blocks
             )
             for i in range(depth)
         ])
@@ -243,7 +241,8 @@ class EnCoder(nn.Module):
         reg_tokens = self.reg_token.expand(B, -1, -1)
         x = torch.cat((cls_tokens_building, cls_tokens_floor, reg_tokens, emb), dim=1)
 
-        x = x + self.pos_embed
+        if hasattr(self, 'pos_embed'):
+            x = x + self.pos_embed
         x = self.pos_drop(x)
 
         for blk in self.blocks:
@@ -255,6 +254,7 @@ class EnCoder(nn.Module):
         reg = x[:, 2]
         return cls_building, cls_floor, reg
 
+
 class MultiHead(nn.Module):
     def __init__(
             self,
@@ -262,12 +262,13 @@ class MultiHead(nn.Module):
             num_buildings: int,
             num_floors: int,
             dropout: float = 0.,
-
+            num_bins: int = 100,
     ):
         super().__init__()
         self.dim = dim
         self.num_buildings = num_buildings
         self.num_floors = num_floors
+        self.num_bins = num_bins
 
         # ── Floor & building heads (computed first — output used to condition coord) ──
         self.floor_head = nn.Sequential(
@@ -287,13 +288,17 @@ class MultiHead(nn.Module):
 
         # ── Coord head: conditioned on floor soft probabilities ──────────────────
         # Input: reg_token (dim) ++ floor_softmax (num_floors)
+        # Output: 2 * num_bins (logits for coordinate bin expectation)
         self.coord_head = nn.Sequential(
             nn.Linear(dim + num_floors, dim // 2),
             nn.LayerNorm(dim // 2),
             nn.GELU(),
             nn.Dropout(dropout),
-            nn.Linear(dim // 2, 2)
+            nn.Linear(dim // 2, 2 * num_bins)
         )
+        
+        # Pre-calculated bin centers in range [0, 1]
+        self.register_buffer('bin_centers', torch.linspace(0.0, 1.0, num_bins))
 
     def _init_weights(self):
         def init_weights(m):
@@ -317,11 +322,86 @@ class MultiHead(nn.Module):
         floor_soft   = F.softmax(floor, dim=-1)           # [B, num_floors]
         reg_cond     = torch.cat([reg, floor_soft], dim=-1)  # [B, dim + num_floors]
 
-        coord = self.coord_head(reg_cond)
-        # Clamp [0,1] — no Sigmoid gradient squashing near boundaries
-        coord = torch.clamp(coord, min=0.0, max=1.0)
+        coord_logits = self.coord_head(reg_cond)  # [B, 2 * num_bins]
+        coord_logits = coord_logits.view(-1, 2, self.num_bins)  # [B, 2, num_bins]
+        
+        # Softmax over bins to get probability distribution
+        coord_probs = F.softmax(coord_logits, dim=-1)  # [B, 2, num_bins]
+        
+        # Expectation: sum(probs * bin_centers)
+        coord = torch.sum(coord_probs * self.bin_centers.to(coord_probs.dtype), dim=-1)  # [B, 2]
 
         return coord, floor, building
+
+class SharedPrivateProjection(nn.Module):
+    def __init__(self, dim: int, shared_dim: int = 128, private_dim: int = 128):
+        super().__init__()
+        self.dim = dim
+        self.shared_dim = shared_dim
+        self.private_dim = private_dim
+        
+        # Shared projection layer
+        self.shared_proj = nn.Linear(dim, shared_dim)
+        
+        # Private projection layers
+        self.private_proj_bld = nn.Linear(dim, private_dim)
+        self.private_proj_flr = nn.Linear(dim, private_dim)
+        self.private_proj_reg = nn.Linear(dim, private_dim)
+        
+        # Output projection layers (to map back to dim)
+        self.out_proj_bld = nn.Linear(shared_dim + private_dim, dim)
+        self.out_proj_flr = nn.Linear(shared_dim + private_dim, dim)
+        self.out_proj_reg = nn.Linear(shared_dim + private_dim, dim)
+        
+    def _init_weights(self):
+        # Initialize projections
+        for m in [self.shared_proj, self.private_proj_bld, self.private_proj_flr, self.private_proj_reg,
+                  self.out_proj_bld, self.out_proj_flr, self.out_proj_reg]:
+            nn.init.trunc_normal_(m.weight, std=.02)
+            if m.bias is not None:
+                nn.init.constant_(m.bias, 0)
+
+    def forward(self, h_bld, h_flr, h_reg):
+        # 1. Project to shared space
+        s_bld = self.shared_proj(h_bld)
+        s_flr = self.shared_proj(h_flr)
+        s_reg = self.shared_proj(h_reg)
+        
+        # 2. Project to private spaces
+        p_bld = self.private_proj_bld(h_bld)
+        p_flr = self.private_proj_flr(h_flr)
+        p_reg = self.private_proj_reg(h_reg)
+        
+        # 3. Concatenate and project back to original dimension
+        out_bld = self.out_proj_bld(torch.cat([s_bld, p_bld], dim=-1))
+        out_flr = self.out_proj_flr(torch.cat([s_flr, p_flr], dim=-1))
+        out_reg = self.out_proj_reg(torch.cat([s_reg, p_reg], dim=-1))
+        
+        # 4. Compute auxiliary losses
+        def safe_cos_sim(x, y, eps=1e-8):
+            # x, y shape: [B, D]
+            # Use sqrt(sum(x^2) + eps) instead of norm(x).clamp(min=eps) to avoid NaN gradients at zero.
+            x_norm = torch.sqrt(torch.sum(x**2, dim=-1) + eps)
+            y_norm = torch.sqrt(torch.sum(y**2, dim=-1) + eps)
+            return torch.sum(x * y, dim=-1) / (x_norm * y_norm)
+        
+        # L_diff: Minimize similarity between different private subspaces (force orthogonality)
+        # Using squared cosine similarity ensures gradients are smooth and penalizes both positive and negative correlation.
+        l_diff = (safe_cos_sim(p_bld, p_flr)**2 + 
+                  safe_cos_sim(p_bld, p_reg)**2 + 
+                  safe_cos_sim(p_flr, p_reg)**2).mean()
+        
+        # L_sim: Shared similarity loss is set to 0.0.
+        # The shared parameter projection layer (shared_proj) is sufficient to learn a shared representation,
+        # and forcing continuous (reg) and categorical (bld, flr) token activations to align causes severe gradient conflict.
+        l_sim = torch.tensor(0.0, device=h_bld.device)
+        
+        # L_sp_diff: Minimize similarity between shared and private subspace of the same task (disentanglement)
+        l_sp_diff = (safe_cos_sim(s_bld, p_bld)**2 + 
+                     safe_cos_sim(s_flr, p_flr)**2 + 
+                     safe_cos_sim(s_reg, p_reg)**2).mean() / 3.0
+        
+        return out_bld, out_flr, out_reg, l_diff, l_sim, l_sp_diff
 
 class Witra(nn.Module):
     def __init__(
@@ -333,13 +413,25 @@ class Witra(nn.Module):
         self.encoder = EnCoder(**encoder_cfg)
         self.multihead = MultiHead(**multihead_cfg)
         
-        # Correctly initialize weights (was missing in previous code)
+        embed_dim = self.encoder.embed_dim
+        self.shared_private_proj = SharedPrivateProjection(
+            dim=embed_dim,
+            shared_dim=embed_dim // 2,
+            private_dim=embed_dim // 2
+        )
+        
+        # Correctly initialize weights
         self.encoder._init_weights()
+        self.shared_private_proj._init_weights()
         self.multihead._init_weights()
     
-    def forward(self, x):
+    def forward(self, x, return_ortho_loss: bool = False):
         cls_building, cls_floor, reg = self.encoder(x)
+        cls_building, cls_floor, reg, l_diff, l_sim, l_sp_diff = self.shared_private_proj(
+            cls_building, cls_floor, reg
+        )
         coord, floor, building = self.multihead(cls_building, cls_floor, reg)
-        return coord, floor, building
-    
-
+        if return_ortho_loss:
+            return coord, floor, building, (l_diff, l_sim, l_sp_diff)
+        else:
+            return coord, floor, building

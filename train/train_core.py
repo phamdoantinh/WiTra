@@ -41,11 +41,17 @@ class Trainer:
             'train_coord_loss': [],
             'train_building_loss': [],
             'train_floor_loss': [],
+            'train_diff_loss': [],
+            'train_sim_loss': [],
+            'train_sp_diff_loss': [],
             
             'val_loss': [],
             'val_coord_loss': [],
             'val_building_loss': [],
             'val_floor_loss': [],
+            'val_diff_loss': [],
+            'val_sim_loss': [],
+            'val_sp_diff_loss': [],
             'val_coord_error': [],
             'val_building_acc': [],
             'val_floor_acc': [],
@@ -71,6 +77,9 @@ class Trainer:
         coord_loss_weight: float = 1.0,
         building_loss_weight: float = 1.0,
         floor_loss_weight: float = 1.0,
+        w_diff: float = 0.01,
+        w_sim: float = 0.0,
+        w_sp_diff: float = 0.01,
     ):
         """Setup optimizer, scheduler and loss function"""
         # Optimizer
@@ -84,8 +93,14 @@ class Trainer:
         self.coord_loss_weight = coord_loss_weight
         self.building_loss_weight = building_loss_weight
         self.floor_loss_weight = floor_loss_weight
+        self.w_diff = w_diff
+        self.w_sim = w_sim
+        self.w_sp_diff = w_sp_diff
         
-        msg = f"Training setup complete:\n   Learning rate: {learning_rate}\n   Loss weights: coord={coord_loss_weight}, building={building_loss_weight}, floor={floor_loss_weight}"
+        msg = (f"Training setup complete:\n"
+               f"   Learning rate: {learning_rate}\n"
+               f"   Loss weights: coord={coord_loss_weight}, building={building_loss_weight}, floor={floor_loss_weight}\n"
+               f"   Auxiliary weights: diff={w_diff}, sim={w_sim}, sp_diff={w_sp_diff}")
         if self.logger:
             self.logger.info(msg)
         else:
@@ -127,6 +142,7 @@ class Trainer:
         building_true: torch.Tensor,
         floor_pred: torch.Tensor,
         floor_true: torch.Tensor,
+        aux_losses: Tuple[torch.Tensor, torch.Tensor, torch.Tensor] = None,
     ) -> Tuple[torch.Tensor, Dict[str, float]]:
         """Compute multi-task loss"""
         # Coordinate loss (MSE or Huber)
@@ -145,11 +161,27 @@ class Trainer:
             self.floor_loss_weight * floor_loss
         )
         
+        diff_val, sim_val, sp_diff_val = 0.0, 0.0, 0.0
+        if aux_losses is not None:
+            l_diff, l_sim, l_sp_diff = aux_losses
+            diff_val = l_diff.item()
+            sim_val = l_sim.item()
+            sp_diff_val = l_sp_diff.item()
+            
+            w_diff = getattr(self, 'w_diff', 0.01)
+            w_sim = getattr(self, 'w_sim', 0.01)
+            w_sp_diff = getattr(self, 'w_sp_diff', 0.01)
+            
+            total_loss = total_loss + w_diff * l_diff + w_sim * l_sim + w_sp_diff * l_sp_diff
+        
         loss_dict = {
             'total': total_loss.item(),
             'coord': coord_loss.item(),
             'building': building_loss.item(),
             'floor': floor_loss.item(),
+            'diff': diff_val,
+            'sim': sim_val,
+            'sp_diff': sp_diff_val,
         }
         
         return total_loss, loss_dict
@@ -166,6 +198,9 @@ class Trainer:
         total_coord_loss = 0
         total_building_loss = 0
         total_floor_loss = 0
+        total_diff_loss = 0
+        total_sim_loss = 0
+        total_sp_diff_loss = 0
         num_batches = 0
         
         pbar = tqdm(train_loader, desc=f'Epoch {epoch}', colour='green')
@@ -177,7 +212,7 @@ class Trainer:
             floor = batch['floor'].to(self.device)
             
             # Forward pass
-            coord_pred, floor_pred, building_pred = self.model(features)
+            coord_pred, floor_pred, building_pred, aux_losses = self.model(features, return_ortho_loss=True)
             
             # Check for NaN in predictions
             if torch.isnan(coord_pred).any():
@@ -190,7 +225,8 @@ class Trainer:
             loss, loss_dict = self.compute_loss(
                 coord_pred, coords,
                 building_pred, building,
-                floor_pred, floor
+                floor_pred, floor,
+                aux_losses=aux_losses
             )
             
             # Backward pass
@@ -207,12 +243,17 @@ class Trainer:
             total_coord_loss += loss_dict['coord']
             total_building_loss += loss_dict['building']
             total_floor_loss += loss_dict['floor']
+            total_diff_loss += loss_dict['diff']
+            total_sim_loss += loss_dict['sim']
+            total_sp_diff_loss += loss_dict['sp_diff']
             num_batches += 1
             
             # Update progress bar
             pbar.set_postfix({
                 'loss': f"{loss_dict['total']:.4f}",
                 'coord': f"{loss_dict['coord']:.4f}",
+                'diff': f"{loss_dict['diff']:.4f}",
+                'sim': f"{loss_dict['sim']:.4f}",
             })
         
         # Average metrics
@@ -221,6 +262,9 @@ class Trainer:
             'coord_loss': total_coord_loss / num_batches,
             'building_loss': total_building_loss / num_batches,
             'floor_loss': total_floor_loss / num_batches,
+            'diff_loss': total_diff_loss / num_batches,
+            'sim_loss': total_sim_loss / num_batches,
+            'sp_diff_loss': total_sp_diff_loss / num_batches,
         }
         
         return metrics
@@ -279,6 +323,9 @@ class Trainer:
         total_coord_loss = 0.0
         total_building_loss = 0.0
         total_floor_loss = 0.0
+        total_diff_loss = 0.0
+        total_sim_loss = 0.0
+        total_sp_diff_loss = 0.0
         num_batches = 0
         
         all_coord_errors = []
@@ -294,7 +341,11 @@ class Trainer:
             floor = batch['floor'].to(self.device)
             
             # Forward pass
-            coord_pred, floor_pred, building_pred = self.model(features)
+            if split != 'test':
+                coord_pred, floor_pred, building_pred, aux_losses = self.model(features, return_ortho_loss=True)
+            else:
+                coord_pred, floor_pred, building_pred = self.model(features)
+                aux_losses = None
             
             # Check if predictions contain NaN during iteration
             if torch.isnan(coord_pred).any():
@@ -321,31 +372,25 @@ class Trainer:
             
             # Compute loss (only for train/val, not test)
             if split != 'test':
-                coord_loss = F.mse_loss(coord_pred, coords)
-                building_loss = F.cross_entropy(building_pred, building)
-                floor_loss = F.cross_entropy(floor_pred, floor)
+                loss, loss_dict = self.compute_loss(
+                    coord_pred, coords,
+                    building_pred, building,
+                    floor_pred, floor,
+                    aux_losses=aux_losses
+                )
                 
-                loss = (self.coord_loss_weight * coord_loss + 
-                       self.building_loss_weight * building_loss + 
-                       self.floor_loss_weight * floor_loss)
-                
-                total_loss += loss.item()
-                total_coord_loss += coord_loss.item()
-                total_building_loss += building_loss.item()
-                total_floor_loss += floor_loss.item()
+                total_loss += loss_dict['total']
+                total_coord_loss += loss_dict['coord']
+                total_building_loss += loss_dict['building']
+                total_floor_loss += loss_dict['floor']
+                total_diff_loss += loss_dict['diff']
+                total_sim_loss += loss_dict['sim']
+                total_sp_diff_loss += loss_dict['sp_diff']
                 num_batches += 1
             
-            # Calculate metrics: denormalize predictions về hệ tọa độ transformed
-            # Train/Val: coords đã normalized [0,1] → cần denorm cả 2
-            # Test: coords ở transformed space [0, max_range] → chỉ denorm predictions
+            # Calculate metrics: denormalize predictions and ground-truth coordinates back to meters
             coord_pred_denorm = self.denorm_coords(coord_pred)  # [0,1] → [0, max_range]
-            
-            if split == 'test':
-                # Test coords đã ở transformed space, không cần denorm
-                coords_denorm = coords
-            else:
-                # Train/Val coords đã normalized, cần denorm
-                coords_denorm = self.denorm_coords(coords)
+            coords_denorm = self.denorm_coords(coords)          # [0,1] → [0, max_range]
             
             # Coordinate error (Euclidean distance in transformed coordinate space)
             coord_error = torch.norm(coord_pred_denorm - coords_denorm, dim=1)
@@ -375,6 +420,9 @@ class Trainer:
             metrics['coord_loss'] = total_coord_loss / num_batches
             metrics['building_loss'] = total_building_loss / num_batches
             metrics['floor_loss'] = total_floor_loss / num_batches
+            metrics['diff_loss'] = total_diff_loss / num_batches
+            metrics['sim_loss'] = total_sim_loss / num_batches
+            metrics['sp_diff_loss'] = total_sp_diff_loss / num_batches
         
         return metrics
     
@@ -414,10 +462,17 @@ class Trainer:
             self.history['train_coord_loss'].append(train_metrics['coord_loss'])
             self.history['train_building_loss'].append(train_metrics['building_loss'])
             self.history['train_floor_loss'].append(train_metrics['floor_loss'])
+            self.history['train_diff_loss'].append(train_metrics['diff_loss'])
+            self.history['train_sim_loss'].append(train_metrics['sim_loss'])
+            self.history['train_sp_diff_loss'].append(train_metrics['sp_diff_loss'])
+            
             self.history['val_loss'].append(val_metrics['loss'])
             self.history['val_coord_loss'].append(val_metrics['coord_loss'])
             self.history['val_building_loss'].append(val_metrics['building_loss'])
             self.history['val_floor_loss'].append(val_metrics['floor_loss'])
+            self.history['val_diff_loss'].append(val_metrics['diff_loss'])
+            self.history['val_sim_loss'].append(val_metrics['sim_loss'])
+            self.history['val_sp_diff_loss'].append(val_metrics['sp_diff_loss'])
             self.history['val_coord_error'].append(val_metrics['coord_error_mean'])
             self.history['val_building_acc'].append(val_metrics['building_acc'])
             self.history['val_floor_acc'].append(val_metrics['floor_acc'])
@@ -425,8 +480,8 @@ class Trainer:
             # Log results
             log_msg = (
                 f"\nEpoch {epoch}/{num_epochs} ({epoch_time:.1f}s)\n"
-                f"  Train: loss={train_metrics['loss']:.4f} (coord={train_metrics['coord_loss']:.4f}, bld={train_metrics['building_loss']:.4f}, flr={train_metrics['floor_loss']:.4f})\n"
-                f"  Valid: loss={val_metrics['loss']:.4f} (coord={val_metrics['coord_loss']:.4f}, bld={val_metrics['building_loss']:.4f}, flr={val_metrics['floor_loss']:.4f})\n"
+                f"  Train: loss={train_metrics['loss']:.4f} (coord={train_metrics['coord_loss']:.4f}, bld={train_metrics['building_loss']:.4f}, flr={train_metrics['floor_loss']:.4f}, diff={train_metrics['diff_loss']:.4f}, sim={train_metrics['sim_loss']:.4f}, sp={train_metrics['sp_diff_loss']:.4f})\n"
+                f"  Valid: loss={val_metrics['loss']:.4f} (coord={val_metrics['coord_loss']:.4f}, bld={val_metrics['building_loss']:.4f}, flr={val_metrics['floor_loss']:.4f}, diff={val_metrics['diff_loss']:.4f}, sim={val_metrics['sim_loss']:.4f}, sp={val_metrics['sp_diff_loss']:.4f})\n"
                 f"  Metrics: error={val_metrics['coord_error_mean']:.2f}m (med={val_metrics['coord_error_median']:.2f}m) | bld_acc={val_metrics['building_acc']:.2f}% | flr_acc={val_metrics['floor_acc']:.2f}%"
             )
             if self.logger:

@@ -58,6 +58,8 @@ def setup_logger(save_dir: str, dataset: str):
 def main(args):
     dataset = args.dataset.lower()
 
+
+
     # ── Hyperparameters ──────────────────────────────────────────
     embed_dim = args.embed_dim
     depth = args.depth
@@ -81,6 +83,7 @@ def main(args):
     logger.info(f"Indoor Positioning MTL — Dataset: {dataset.upper()} | strategy=UW (LibMTL)")
     logger.info("=" * 60)
     logger.info(f"epochs={args.epochs}  lr={lr}  batch={batch_size}  device={args.device}")
+    logger.info(f"w_diff={args.w_diff}  w_sp_diff={args.w_sp_diff}")
     logger.info(f"normalization={norm_method}  save_dir={save_dir}")
     logger.info(f"log: {log_file}")
 
@@ -151,8 +154,8 @@ def main(args):
                     "qkv_bias":      False,
                     "qk_norm":       True,
                     "porj_bias":     True,
-                    "attn_drop":     0.0,
-                    "proj_drop":     0.0,
+                    "attn_drop":     dropout,
+                    "proj_drop":     dropout,
                 },
             },
             "learn_pos": True,
@@ -163,6 +166,7 @@ def main(args):
             "num_buildings": num_buildings,
             "num_floors":    num_floors,
             "dropout":       dropout,
+            "num_bins":      args.num_bins,
         },
     )
     n_params = sum(p.numel() for p in model.parameters())
@@ -179,10 +183,13 @@ def main(args):
         mtl_kwargs            = {},
         floor_focal_gamma     = args.floor_focal_gamma,
         floor_acc_weight      = args.floor_acc_weight,
+        w_diff                = args.w_diff,
+        w_sim                 = 0.0,
+        w_sp_diff             = args.w_sp_diff,
     )
     trainer.setup_training(
         learning_rate = lr,
-        weight_decay  = 0.01,
+        weight_decay  = args.weight_decay,
     )
     if args.scheduler != "none":
         trainer.setup_scheduler(
@@ -223,6 +230,7 @@ def main(args):
         "epochs": args.epochs,
         "batch_size": batch_size,
         "lr": lr,
+        "weight_decay": args.weight_decay,
         "rssi_noise_std": rssi_noise_std,
         "wap_drop_rate": wap_drop_rate,
         "norm_method": norm_method,
@@ -269,6 +277,7 @@ if __name__ == "__main__":
     p.add_argument("--epochs",      type=int,   default=300,          help="Epochs (300 for augmentation)")
     p.add_argument("--batch-size",  type=int,   default=128,          help="Batch size")
     p.add_argument("--lr",          type=float, default=8e-4,         help="Learning rate")
+    p.add_argument("--weight-decay", type=float, default=0.01,         help="Weight decay")
     p.add_argument("--scheduler",   type=str,   default="cosine",     help="cosine|step|none")
     p.add_argument("--device",      type=str,   default="cuda",       help="cuda|cpu")
     p.add_argument("--save-dir",    type=str,   default=None)
@@ -287,6 +296,17 @@ if __name__ == "__main__":
                    help="Focal Loss gamma for floor task (0=plain CE, 2=default focal)")
     p.add_argument("--floor-acc-weight",      type=float, default=10.0,
                    help="Weight for floor acc in composite checkpoint score (higher=prioritize floor)")
+
+    # Shared-Private Orthogonality Weights
+    p.add_argument("--w-diff", type=float, default=0.01,
+                   help="Weight of the private subspace difference (orthogonality) loss")
+    p.add_argument("--w-sp-diff", type=float, default=0.01,
+                   help="Weight of the shared-private difference (orthogonality) loss")
+
+    # Soft-Argmax Bins
+    p.add_argument("--num-bins", type=int, default=100,
+                   help="Number of bins for Soft-Argmax coordinate regression")
+
 
     args = p.parse_args()
 
