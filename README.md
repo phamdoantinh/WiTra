@@ -1,104 +1,112 @@
-# WiTra: Vision Transformer for WiFi-based Indoor Positioning
+# WiTra: A Compact Transformer for Hierarchical WiFi Indoor Localization
 
-WiTra is a Vision Transformer (ViT) architecture customized for multi-task WiFi-based indoor positioning. It jointly predicts the **Building** (classification), **Floor** (classification), and **Coordinates** (regression) of a device from WiFi Received Signal Strength Indicator (RSSI) fingerprints.
+WiTra jointly predicts building, floor and 2D coordinates from a WiFi RSSI
+fingerprint. Each retained access point (AP) becomes one token; three
+task-specific readout tokens pass through a shared Transformer encoder, and the
+predicted floor probabilities condition an expectation-based coordinate
+decoder. During training, a floor-head update correction constrains the
+first-order floor-loss contribution of each Floor Head step relative to a
+floor-supervised reference step.
 
----
+This repository contains the code for the revised manuscript submitted to
+*Results in Engineering*: data preparation, the model, training, evaluation and
+all configurations reported in the paper.
 
-## Architecture Overview
+![WiTra architecture](assets/witra_architecture.png)
 
-1. **Vision Transformer Backbone**: Pre-processes 1D RSSI vectors into token embeddings and adds learnable positional encodings.
-2. **Specialized Multi-Task Tokens**: Rather than a single class token, WiTra prepends three specialized learnable tokens:
-   - `cls_token_building`: Captured representation for building classification.
-   - `cls_token_floor`: Captured representation for floor classification.
-   - `reg_token`: Captured representation for coordinate regression.
-3. **Shared-Private Projection**: Separates task-specific features (cls/reg representations) into Shared and Private subspaces via a projection layer, applying difference losses (`l_diff` and `l_sp_diff`) to enforce orthogonality and prevent redundant feature learning.
-4. **Soft-Argmax Coordinate Head**: Employs an expectation-based binning head (Soft-Argmax) instead of a direct linear regressor, producing smooth coordinate predictions constrained in $[0.0, 1.0]$.
-5. **Differentiable Floor Conditioning**: The coordinate head accepts the coordinates regressor representation (`reg_token`) concatenated with the *soft probability distribution* of the floor classification head. By avoiding `detach()`, gradients from the coordinate regression head backpropagate into the floor classifier, acting as a spatial regularizer.
-6. **Adaptive Multi-Task Weighting**: Integrated with the `LibMTL` library using Uncertainty Weighting (UW) to balance the classification and regression losses dynamically.
-7. **Spatial Normalization over Union Bounding Box**: Normalizes target coordinates based on the spatial bounding box of the *union* of both train and test datasets, preventing out-of-bounds clipping by the Soft-Argmax head.
-8. **Fingerprint Augmentation**: Supports K-Nearest Neighbors (KNN) fingerprint interpolation to augment sparse datasets (e.g., Tampere), mitigating overfitting.
-
----
-
-## Project Structure
+## Repository layout
 
 ```text
-WiTra/
-├── dataprocess/
-│   ├── data_loader.py       # Data loading & dataset loaders
-│   └── data_process.py      # Normalization, augmentation, and dataset parser
-├── model/
-│   └── witra.py             # WiTra model (Embedding, Encoder, MultiHead, and Witra modules)
-├── train/
-│   ├── train.py             # Main training entry point
-│   ├── train_core.py        # Core single-task/fixed trainer loop
-│   ├── mtl_trainer.py       # Multi-task trainer with LibMTL adaptation
-│   ├── mtl_adapter.py       # Bridge factory to AbsWeighting in LibMTL
-│   └── mtl_losses.py        # Custom multi-task loss functions
-└── README.md
+src/
+  run.py                  command-line entry point (train / evaluate / aggregate)
+  trainer.py              training, validation-selected evaluation, aggregation
+  floor_protection.py     floor-head update correction (Eq. 13, Algorithm 1)
+  uncertainty_weighting.py LibMTL uncertainty weighting (bundled, MIT license)
+  prepare_data.py         splits, training-fitted preprocessing, TUT augmentation
+  model/witra.py          embedding, encoder, task heads
+  dataprocess/            RSSI normalization and dataset readers
+  scripts/                setup, data preparation and run launchers
 ```
 
----
+## Setup
 
-## Installation & Setup
+Python 3.12 with PyTorch 2.8 (CUDA). BF16 training needs a GPU with BF16 support.
 
-1. **Clone the Repository**:
-   ```bash
-   git clone https://github.com/Greediex/WiTra.git
-   cd WiTra
-   ```
-
-2. **Clone the `LibMTL` Dependency**:
-   WiTra relies on the `LibMTL` framework for multi-task loss weighting. Clone the official library into the repository root:
-   ```bash
-   git clone https://github.com/median-research-group/LibMTL.git
-   ```
-
-3. **Install Dependencies**:
-   Ensure you have PyTorch, NumPy, Pandas, and Tqdm installed:
-   ```bash
-   pip install torch numpy pandas tqdm
-   ```
-
----
-
-## Datasets Supported
-
-- **UJIIndoorLoc** (`uji`)
-- **UTSIndoorLoc** (`uts`)
-- **Tampere** (`tampere`)
-
----
-
-## Running Training
-
-To run training, use the `train/train.py` script.
-
-### Recommended Command (UJI Dataset)
-For optimal convergence on UJIIndoorLoc, run:
 ```bash
-python train/train.py \
-  --dataset uji \
-  --train-data uji_data/raw/trainingData.csv \
-  --test-data uji_data/raw/validationData.csv \
-  --norm-method mean_center \
-  --batch-size 32 \
-  --lr 1e-4
+bash src/scripts/setup.sh                       # creates src/.venv
+export WITRA_PYTHON="$PWD/src/.venv/bin/python"  # or the python of an existing environment
+export WITRA_DEVICE=cuda:0
 ```
 
-### Options
-- `--dataset`: Choose between `uji`, `uts`, or `tampere`.
-- `--train-data`: Path to train CSV file (required for `uji` and `uts`).
-- `--test-data`: Path to test CSV file (required for `uji` and `uts`).
-- `--tampere-dir`: Path to Tampere raw dataset directory (required for `tampere`).
-- `--norm-method`: Normalization method (`normal`, `power`, or `mean_center`).
-- `--lr`: Learning rate (default: `8e-4`).
-- `--batch-size`: Batch size (default: `128`).
-- `--epochs`: Number of training epochs (default: `300`).
-- `--num-bins`: Number of bins for Soft-Argmax coordinate regression (default: `100`).
-- `--w-diff`: Weight of the private subspace difference (orthogonality) loss (default: `0.01`).
-- `--w-sp-diff`: Weight of the shared-private difference (orthogonality) loss (default: `0.01`).
-- `--aug-n`: Fingerprint interpolation factor (automatically defaults to `8` for `tampere` to perform KNN augmentation, `0` otherwise).
-- `--aug-k`: KNN neighbors for interpolation (default: `5`).
-- `--floor-focal-gamma`: Focal Loss gamma for floor task (default: `2.0`).
-- `--floor-acc-weight`: Weight for floor acc in composite checkpoint score (default: `10.0`).
+## Data
+
+Raw datasets are not redistributed. Download UJIIndoorLoc, UTSIndoorLoc and
+Tampere (TUT2017) and arrange them as:
+
+```text
+indoorloc/
+  uji_data/raw/{trainingData.csv,validationData.csv}
+  UTSIndoorLoc-dataset/uts_data/raw/{UTS_training.csv,UTS_test.csv}
+  tampere_data/raw/{Training_rss.csv,Training_coordinates.csv,Test_rss.csv,Test_coordinates.csv}
+```
+
+Prepare each dataset once; all training seeds share these partitions:
+
+```bash
+export WITRA_DATA_ROOT=/absolute/path/to/indoorloc
+export WITRA_PREPARED_ROOT="$PWD/prepared"
+bash src/scripts/prepare_data.sh uji
+bash src/scripts/prepare_data.sh uts
+bash src/scripts/prepare_data.sh tampere
+```
+
+The official UJIIndoorLoc validation file is the test set. Internal validation
+is fold 0 of a five-fold stratified group split of the official training data
+(split seed 42; identical fingerprints stay in one fold). AP filtering,
+coordinate bounds and the mean-centred RSSI transform are fitted on the
+internal training partition. For TUT, KNN augmentation (k = 5, eight samples
+per fingerprint) is applied to the internal training partition only.
+
+## Reproducing the paper
+
+`run.py` defaults to the paper's settings: depth 2, width 160, FFN ratio 1,
+eight heads, 100 bins per axis, AdamW (weight decay 0.01), cosine schedule to
+zero, 300 epochs, BF16 with SDPA, learning rate 8e-4 / 1e-4 / 1e-4 and batch
+size 32 / 32 / 16 for UJIIndoorLoc / UTS / TUT.
+
+```bash
+export WITRA_RUNS="$PWD/runs"
+bash src/scripts/run.sh train uji 42            # dataset, seed [width]
+bash src/scripts/run.sh test  uji 42
+bash src/scripts/run.sh train uts 43 40         # embedding width 40
+```
+
+Repeat for seeds 42, 43 and 44 and for `uji`, `uts` and `tampere`. Widths 64
+and 40 give the smaller models of Table 7. Mean and sample standard deviation
+across seeds:
+
+```bash
+cd src
+python run.py aggregate --output-root "$WITRA_RUNS/d160" \
+  --datasets uji uts tampere --seeds 42 43 44 --output "$WITRA_RUNS/d160/summary.json"
+```
+
+## Outputs
+
+```text
+runs/d160/uji/MAIN/seed_42/
+  manifest.json     configuration, software, data and source hashes, selected epoch
+  history.json      per-epoch training losses and validation metrics
+  best.pt           validation-selected checkpoint
+  metrics.json      test metrics (after evaluate)
+  predictions.csv   per-sample predictions and errors (after evaluate)
+```
+
+Mean 2D error is the Euclidean distance between predicted and true horizontal
+coordinates in metres. Runs are never overwritten. Evaluation verifies that the
+current source files match the hashes recorded at training time; evaluate a run
+with the code revision that trained it.
+
+## License
+
+The bundled LibMTL files keep their MIT license (`src/LibMTL/LICENSE`).
